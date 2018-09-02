@@ -52,6 +52,39 @@ void emit_alert(String *out, String msg, const char *alert_type)
   *out += "</div>\n";
 }
 
+extern const char PROGMEM ___bootstrap_min_css_gz [];
+extern unsigned int ___bootstrap_min_css_gz_len;
+
+void emit_not_modified(void)
+{
+  String header = "HTTP/1.1 304 Not Modified\r\nCache-Control: public, max-age=30672000\r\n\r\n";
+  httpServer.sendContent(header);
+}
+
+void handle_bootstrap_min_css()
+{
+  /*
+  if(security_level() > AUTH_NONE){
+    DEBUG("Sending 304 Not modified bootstrap_min_css_gz\n");
+    emit_not_modified();
+    return;
+  }
+  DEBUG("Sending bootstrap_min_css_gz\n");
+  */
+  httpServer.sendHeader("Cache-Control", "public, max-age=max-age=30672000");
+  httpServer.sendHeader("Content-Encoding", "gzip");
+  httpServer.send_P(200, "text/css", ___bootstrap_min_css_gz, ___bootstrap_min_css_gz_len);
+  //DEBUG("Sending done.\n");
+}
+
+static const char *zoom;
+
+void set_zoom(const char *z)
+{
+  zoom = z;
+}
+
+  
 void emit_html_begin(String *out, String htmltitle, bool onoff, int refresh)
 {
   char buffer[33];
@@ -62,7 +95,14 @@ void emit_html_begin(String *out, String htmltitle, bool onoff, int refresh)
   if(refresh)httpServer.sendHeader("Refresh", itoa(refresh, buffer,10));
   httpServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
   httpServer.send(200, "text/html", ""); // Empty content inhibits Content-length header so we have to close the socket ourselves.
-  httpServer.sendContent_P(templatea1);
+  httpServer.sendContent_P(templatea1a);
+  if(zoom && *zoom){
+    *out = "html { font-size:";
+    *out += zoom;
+    *out += "; }";
+    httpServer.sendContent(*out);
+  }
+  httpServer.sendContent_P(templatea1b);
   *out = "<title>";
   *out += htmltitle;
   *out += "</title></head><body><div class=\"container\">\n";
@@ -76,8 +116,10 @@ void emit_html_begin(String *out, String htmltitle, bool onoff, int refresh)
 void emit_html_end(String *out)
 {
   httpServer.sendContent(*out);
+  //DEBUG("emit_html_end(): emitting '%s'\n", (*out).c_str());
+  *out = "";
   httpServer.sendContent_P(templatea2);
-  httpServer.client().stop(); // Stop is needed because we sent no content length
+  //DEBUG("emit_html_end(): normal end\n");
 }
 
 void emit_form_begin(String *out, String formtitle, String action)
@@ -136,20 +178,12 @@ void emit_nbsp(String *out)
   *out += "&nbsp;";
 }
 
-void handle_custom(const char *zoom)
-{
-  String msg = custom_css;
-  msg += "html { font-size:";
-    msg += zoom;
-    msg += "; }";
-  httpServer.send(200, "text/css", msg);
-}
-
 void handle_login(const char *location)
 {
   String msg;
   String out;
 
+  //DEBUG("Login Entering\n");
   if(!session_cookie.length())gencookie();
   if (httpServer.hasArg("User") && httpServer.hasArg("Password")){
     bool valid_auth = false;
@@ -168,7 +202,7 @@ void handle_login(const char *location)
       header += " \r\nCache-Control: no-cache\r\n\r\n";
       httpServer.sendContent(header);
       trycount = 0; //With good headers in mind, reset the trycount buffer
-      Serial.printf("Login OK\n");
+      DEBUG("Login OK\n");
       delay(100);
       return;
     }
@@ -220,30 +254,40 @@ void emit_access_denied(const char *link)
   emit_button(&out, "OK", "primary", link);
   out += "</div></center></div\n";
   emit_html_end(&out);
-  Serial.printf("Permission denied.\n");
+  DEBUG("Permission denied.\n");
   delay(100);
   return;
 }
 
-bool auth_level(int auth_level)
+int security_level(void)
 {
-  String uri = "/";
-
   if (httpServer.hasHeader("Cookie")){
     String cookie = httpServer.header("Cookie");
     String authk = "c=" + session_cookie;
-    //Serial.printf("Cookie:'%s' Session_cookie:'%s'\n",cookie.c_str(), session_cookie.c_str());
-    //Serial.printf("Privilege level:%d Requested:%d\n", privilege_level, auth_level);
+    //DEBUG("Cookie:'%s' Session_cookie:'%s'\n",cookie.c_str(), session_cookie.c_str());
     if (cookie == authk){
-      if(privilege_level >= auth_level){
-        return(true);
-      }
-      else {
-        return(false);
-      }
+      //DEBUG("Privilege level:%d\n", privilege_level);
+      return(privilege_level);
+    }
+    else {
+      return(AUTH_NONE);
     }
   }
-  Serial.printf("Wrong cookie, starting login screen\n");
+}
+
+bool is_authenticated(int auth_level)
+{
+  if(security_level() > AUTH_NONE){
+    if(privilege_level >= auth_level){
+      return(true);
+    }
+    else {
+      emit_access_denied("/");
+      return(false);
+    }
+  }
+  DEBUG("Wrong cookie, starting login screen\n");
+  String uri = "/";
   if (httpServer.hasHeader("URI")){
     uri = httpServer.header("uri");
   }
@@ -275,6 +319,7 @@ void loop_login(void)
     reset_login_inactivity();
     //if there is no activity from loged on user, change the generate a new cookie. This is more secure than adding expiry to the cookie header
   }
+  // No AP 15 minutes after booting if none connected
   if(!WiFi.softAPgetStationNum() && (mymillis > (15L*60*1000)))WiFi.softAPdisconnect(true); 
 }
 
@@ -282,7 +327,7 @@ void handle_restart()
 {
   String out;
 
-  if(!auth_level(AUTH_USER)){
+  if(!is_authenticated(AUTH_USER)){
     emit_access_denied("/login");
     return;
   }
@@ -309,7 +354,10 @@ bool sanitize_strarg(const char *name, char *buf)
   int i;
   String s;
 
-  if(!httpServer.hasArg(name))return(false);
+  if(!httpServer.hasArg(name)){
+    DEBUG("sanitize_ularg() name='%s' NOT FOUND!\n", name);
+    return(false);
+  }
   s = httpServer.arg(name);
   for(i = 1, pcd = s.c_str(), pca = buf; i < SIZE_PARAM; i++){
     if(!*pcd) break;
@@ -321,8 +369,12 @@ bool sanitize_strarg(const char *name, char *buf)
 
 bool sanitize_ularg(const char *name, unsigned long *ul)
 {
-  if(!httpServer.hasArg(name))return(false);
+  if(!httpServer.hasArg(name)){
+    DEBUG("sanitize_ularg() name='%s' NOT FOUND!\n", name);
+    return(false);
+  }
   *ul = atol(httpServer.arg(name).c_str());
+  //DEBUG("sanitize_ularg('%s','%s') = %ul\n", name, httpServer.arg(name).c_str(), *ul);
   return(true);
 }
 
@@ -356,33 +408,45 @@ void quick_blink(int num)
   }
 }
 
-void try_connect_wifi(void)
+/*
+void try_connect_wifi(const char *ssid, const char *password)
 {
-  Serial.print("try_connect_wifi(): ");
-  switch(WiFi.waitForConnectResult()) {
+  static int last_status = WL_IDLE_STATUS;
+  int status = WiFi.status();
+  DEBUG("try_connect_wifi(): ");
+  switch(WiFi.status()) {
     case WL_CONNECTED:
-    Serial.println("WIFI Connected.");
-    quick_blink(10);
+    if(last_status != status){
+      ArduinoOTA.begin();
+      httpServer.begin();
+      MDNS.begin(params.hostname);
+      MDNS.addService("http", "tcp", 80);
+      DEBUG("WIFI Connected.\n");
+      quick_blink(10);
+    }
     break;
     case WL_NO_SSID_AVAIL:
-    Serial.print("SSID Not Found: ");
-    Serial.println(params.wifi_ssid);
+    DEBUG("SSID Not Found: \n", params.wifi_ssid);
     quick_blink(2);
     break;
     case WL_CONNECT_FAILED:
-    Serial.print("Incorrect password for SSID: ");
-    Serial.println(params.wifi_ssid);
+    DEBUG("Incorrect password for SSID:'%s' \n", params.wifi_ssid);
     quick_blink(3);
     break;
     case WL_DISCONNECTED:
-    Serial.println("Not in STATION mode!");
-    quick_blink(4);
+    DEBUG("Disconnected...\n");
     break;
     case WL_IDLE_STATUS:
     default:
-    Serial.println("Changing status...");
+    DEBUG("Changing status...\n");
     quick_blink(5);
     break;
   }
+  if(status != WL_CONNECTED){
+    DEBUG("WFI AP: Trying to reconnect...\n");
+    WiFi.begin(ssid, password);
+  }
+  last_status = status;
 }
+*/
 

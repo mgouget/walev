@@ -37,9 +37,10 @@ time_t max_on_time = 0;
 time_t mytime;
 int nb_sense;
 int nb_dry;
+int relay_status;
 
 
-#define FIRMWARE_VERSION 4
+#define FIRMWARE_VERSION 7
 #define EEPROM_VERSION 2
 
 // If order of parameters changed, must increase version.
@@ -72,13 +73,13 @@ struct Sparameters factory_params = {
   sizeof(struct Sparameters),
   "TATANKA5G", /* wifi_ssid */
   "tatanka5", /* wifi_password */
-  "SONOFF", /* hostname */
+  "PADUA1", /* hostname */
   "3vw", /* zoom */
   "/firmware", /* update_path */
   "user", /* http_user */
-  "golwen1", /* http_password */
+  "password", /* http_password */
   "admin", /* admin_user */
-  "Mgolwen1", /* admin_password */
+  "password", /* admin_password */
   2, // time_pause (s)
   2, // time_sense (s)
   10, // time_drive (s)
@@ -108,10 +109,9 @@ void load_eeprom()
   EEPROM.begin(512);
   EEPROM.get(0, params);
   EEPROM.end();
-  Serial.print("EEPROM_VERSION: "); Serial.print(factory_params.eeprom_version);
-  Serial.print(" Read: "); Serial.println(params.eeprom_version);
+  DEBUG("EEPROM_VERSION:%d ; Read:%d\n", factory_params.eeprom_version, params.eeprom_version);
   if(params.eeprom_version != factory_params.eeprom_version){
-    Serial.println("WARNING, Factory reset!");
+    DEBUG("WARNING, Factory reset!\n");
     memcpy(&params, &factory_params, sizeof(params));
     save_eeprom();
   }
@@ -125,10 +125,10 @@ void load_eeprom()
       memcpy(pba, pbd, factory_params.eeprom_size - sz);
       params.eeprom_size = factory_params.eeprom_size;
       save_eeprom();
-      Serial.println("EEPROM updated.");
+      DEBUG("EEPROM updated.\n");
     }
     else {
-      Serial.println("Parameters imported.");
+      DEBUG("Parameters imported.\n");
     }
   }
 }
@@ -139,8 +139,9 @@ void handle_root()
   String message;
   const char *alert_type = "default";
 
-  if(!auth_level(AUTH_USER)){
-    emit_access_denied("/login");
+  //DEBUG("handle_root(): Entering\n");
+  if(!is_authenticated(AUTH_USER)){
+    DEBUG("handle_root(): Not authenticated\n");
     return;
   }
   emit_html_begin(&out, params.hostname, relay_state, 5);
@@ -148,26 +149,41 @@ void handle_root()
   message = "<center><h4>Switch is ";
   if(state == ST_FORCING){
     message += " forced to ";
-  }
-  if(relay_state == ON){
-    message += "ON";
-    alert_type = "warning";
+    if(relay_state == ON){
+      message += "ON";
+      alert_type = "warning";
+    }
+    else {
+      message += "OFF";
+      alert_type = "success";
+    }
   }
   else {
-    message += "OFF";
-    alert_type = "success";
+    if(relay_status == ON){
+      message += "ON";
+      alert_type = "warning";
+    }
+    else {
+      message += "OFF";
+      alert_type = "success";
+    }
   }
   message += "</h4></center>";
   emit_alert(&out, message, alert_type);
   out += "<div class=\"container\">\n";
   out += "<center><div class=\"span2\">\n";
-  if(state == ST_FORCING){
-    emit_button(&out, "Back Normal", "primary", "/back_normal");
+  if(state == ST_ALARM){
+    emit_alert(&out, "ALARM", "danger");
   }
-  emit_button(&out, "OFF", "success", "/off");
-  emit_button(&out, "ON", "danger", "/on");
+  else {
+    if(state == ST_FORCING){
+      emit_button(&out, "Back Normal", "primary", "/back_normal");
+    }
+    emit_button(&out, "OFF", "success", "/off");
+    emit_button(&out, "ON", "danger", "/on");
+  }
 
-  if(auth_level(AUTH_ADMIN)){
+  if(security_level() >= AUTH_ADMIN){
     out += "</div><div class=\"span2\">\n";
     emit_button(&out, "Parameters", "info", "/parameters");
     emit_button(&out, "Firmware", "info", "/firmware");
@@ -180,15 +196,14 @@ void handle_root()
 
   emit_html_end(&out);
   reset_login_inactivity();
+  //DEBUG("handle_root(): Normal end\n");
 }
 
 void handle_back_normal()
 {
-  if(!auth_level(AUTH_USER)){
-    emit_access_denied("/login");
-    return;
-  }
+  if(!is_authenticated(AUTH_USER))return;
   set_relay(OFF);
+  relay_status = OFF;
   state = ST_STARTING;
   next_time = millis();
   httpServer.sendContent("HTTP/1.1 301 OK\nLocation: /\nCache-Control: no-cache\n\n");
@@ -197,28 +212,33 @@ void handle_back_normal()
 
 void handle_onoff(int onoff)
 {
-  if(!auth_level(AUTH_USER)){
-    emit_access_denied("/login");
-    return;
-  }
+  if(!is_authenticated(AUTH_USER))return;
   // If forced on, reset to normal after max_forced_duration minutes
   // If forced off, continue forever
   state = ST_FORCING;
   set_relay(onoff);
-  if(relay_state == ON)next_time = millis() + (params.max_forced_duration * 60 * 1000);
+  relay_status = onoff;
+  if(relay_state == ON){
+    next_time = millis() + (params.max_forced_duration * 60 * 1000);
+    DEBUG("Setting ST_FORCING, millis=%lu next_time=%lu\n", millis(), next_time);
+  }
   else next_time = 0;
   httpServer.sendContent("HTTP/1.1 301 OK\nLocation: /\nCache-Control: no-cache\n");
   reset_login_inactivity();
 }
 
+#define ARG_TIME_PAUSE "time_pause (s)"
+#define ARG_TIME_SENSE "time_sense (s)"
+#define ARG_TIME_DRIVE "time_drive (s)"
+#define ARG_MAX_FORCED_DURATION "max_forced_dur.(min)"
+#define ARG_MAX_ON_DURATION "max_on_duration (min)"
+#define ARG_MIN_DRY_PERCENT  "min_dry_percent (%)"
+
 void handle_parameters()
 {
   String out;
 
-  if(!auth_level(AUTH_ADMIN)){
-    emit_access_denied();
-    return;
-  }
+  if(!is_authenticated(AUTH_ADMIN))return;
   emit_html_begin(&out, params.hostname, relay_state);
 
   {
@@ -244,17 +264,17 @@ void handle_parameters()
   emit_form_col(&out);
   emit_form_strfield(&out, "admin_password", params.admin_password);
   emit_form_row(&out);
-  emit_form_numfield(&out, "time_pause (s)", params.time_pause);
+  emit_form_numfield(&out, ARG_TIME_PAUSE, params.time_pause);
   emit_form_col(&out);
-  emit_form_numfield(&out, "time_sense (s)", params.time_sense);
+  emit_form_numfield(&out, ARG_TIME_SENSE, params.time_sense);
   emit_form_row(&out);
-  emit_form_numfield(&out, "time_drive (s)", params.time_drive);
+  emit_form_numfield(&out, ARG_TIME_DRIVE, params.time_drive);
   emit_form_col(&out);
-  emit_form_numfield(&out, "max_forced_dur. (min)", params.max_forced_duration);
+  emit_form_numfield(&out, ARG_MAX_FORCED_DURATION, params.max_forced_duration);
   emit_form_row(&out);
-  emit_form_numfield(&out, "max_on_duration (min)", params.max_on_duration);
+  emit_form_numfield(&out, ARG_MAX_ON_DURATION, params.max_on_duration);
   emit_form_col(&out);
-  emit_form_numfield(&out, "min_dry_percent (%)", params.min_dry_percent);
+  emit_form_numfield(&out, ARG_MIN_DRY_PERCENT, params.min_dry_percent);
   emit_form_end(&out, "Update Parameters");
   emit_html_end(&out);
   reset_login_inactivity();
@@ -265,10 +285,7 @@ void handle_update_parameters()
   bool must_reboot = false;
   char str[SIZE_PARAM];
   unsigned long ul;
-  if(!auth_level(AUTH_ADMIN)){
-    emit_access_denied();
-    return;
-  }
+  if(!is_authenticated(AUTH_ADMIN))return;
   if(sanitize_strarg("wifi_ssid", str)){
     if(strcmp(str, params.wifi_ssid)){
       must_reboot = true;
@@ -308,12 +325,12 @@ void handle_update_parameters()
       strcpy(params.admin_password, str);
     }
   }
-  if(sanitize_ularg("time_pause", &ul))params.time_pause = ul;
-  if(sanitize_ularg("time_sense", &ul))params.time_sense = ul;
-  if(sanitize_ularg("time_drive", &ul))params.time_drive = ul;
-  if(sanitize_ularg("max_forced_duration", &ul))params.max_forced_duration = ul;
-  if(sanitize_ularg("max_on_duration", &ul))params.max_on_duration = ul;
-  if(sanitize_ularg("min_dry_percent", &ul))params.min_dry_percent = ul;
+  if(sanitize_ularg(ARG_TIME_PAUSE, &ul))params.time_pause = ul;
+  if(sanitize_ularg(ARG_TIME_SENSE, &ul))params.time_sense = ul;
+  if(sanitize_ularg(ARG_TIME_DRIVE, &ul))params.time_drive = ul;
+  if(sanitize_ularg(ARG_MAX_FORCED_DURATION, &ul))params.max_forced_duration = ul;
+  if(sanitize_ularg(ARG_MAX_ON_DURATION, &ul))params.max_on_duration = ul;
+  if(sanitize_ularg(ARG_MIN_DRY_PERCENT, &ul))params.min_dry_percent = ul;
   save_eeprom();
   String out;
   emit_html_begin(&out, params.hostname, relay_state);
@@ -324,20 +341,59 @@ void handle_update_parameters()
   message += "</center>";
   emit_alert(&out, message, "warning");
   out += "<div class=\"container\"><center><div class=\"span1\">\n";
-  emit_button(&out, "OK", "primary", "/parameters");
+  emit_button(&out, "OK", "primary", "/");
   out += "</div></center></div\n";
   emit_html_end(&out);
   reset_login_inactivity();
 }
 
+void try_connect_wifi(void)
+{
+  static int last_status = WL_IDLE_STATUS;
+  int status = WiFi.status();
+  DEBUG("try_connect_wifi(): ");
+  switch(WiFi.status()) {
+    case WL_CONNECTED:
+    if(last_status != status){
+      DEBUG("WIFI Connected.\n");
+      quick_blink(10);
+    }
+    break;
+    case WL_NO_SSID_AVAIL:
+    DEBUG("SSID Not Found: \n", params.wifi_ssid);
+    quick_blink(2);
+    break;
+    case WL_CONNECT_FAILED:
+    DEBUG("Incorrect password for SSID:'%s' \n", params.wifi_ssid);
+    quick_blink(3);
+    break;
+    case WL_DISCONNECTED:
+    DEBUG("Disconnected...\n");
+    break;
+    case WL_IDLE_STATUS:
+    default:
+    DEBUG("Changing status...\n");
+    quick_blink(5);
+    break;
+  }
+  if(status != WL_CONNECTED){
+    DEBUG("WFI AP: Trying to reconnect...\n");
+    WiFi.begin(params.wifi_ssid, params.wifi_password);
+  }
+  last_status = status;
+}
+
+
 void setup() {
   Serial.begin(115200);
+  Serial.println("Booting");
   { // Avoid wasting memory!
     char str[32];
     sprintf(str, "ESP_%X", ESP.getChipId());
     strcpy(factory_params.hostname, str);
   }
   memcpy(&params, &factory_params, sizeof(params));
+  set_zoom(params.zoom);
 
   pinMode(button_pin, INPUT_PULLUP);
   pinMode(io_pin, INPUT_PULLUP);
@@ -349,22 +405,20 @@ void setup() {
   analogWriteRange(1000);
   analogWrite(led_pin, 990);
 
-  Serial.println("Booting");
-
   load_eeprom();
 
   // WIFI
+  WiFi.hostname(params.hostname);
+  WiFi.setAutoReconnect(false); // Otherwise: infinite loop when can't connect...
   WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(params.wifi_ssid, params.wifi_password);
   WiFi.softAPConfig(apIP, apIP, netMsk);
   WiFi.softAP(params.hostname);
-  delay(500); // Without delay I've seen the IP address blank
-  WiFi.hostname(params.hostname);
-  WiFi.begin(params.wifi_ssid, params.wifi_password);
+  //delay(500); // Without delay I've seen the IP address blank
   ArduinoOTA.begin();
   httpServer.begin();
   MDNS.begin(params.hostname);
   MDNS.addService("http", "tcp", 80);
-  try_connect_wifi();
 
   // OTA
   ArduinoOTA.setHostname(params.hostname);
@@ -382,6 +436,7 @@ void setup() {
     (void)error;
     ESP.restart();
   });
+  ArduinoOTA.begin();
 
   // httpserver
   httpServer.onNotFound(handle_notfound);
@@ -394,15 +449,15 @@ void setup() {
   httpServer.on("/update_parameters", handle_update_parameters);
   httpServer.on("/login", [](){handle_login("/");});
   httpServer.on("/logout", handle_logout);
-  httpServer.on("/custom.css", []() {handle_custom(params.zoom);});
+  httpServer.on("/bootstrap_min.css", handle_bootstrap_min_css);
   const char * headerkeys[] = {"User-Agent","Cookie"} ;
   size_t headerkeyssize = sizeof(headerkeys)/sizeof(char*);
   httpServer.collectHeaders(headerkeys, headerkeyssize ); //These 3 lines tell esp to collect User-Agent and Cookie in http header when request is made
-
+  httpServer.begin();
 
   httpUpdater.setup(&httpServer, params.update_path, params.admin_user, params.admin_password);
 
-  Serial.println("Ready");
+  DEBUG("Ready\n");
   state = ST_STARTING;
   next_time = millis();
 }
@@ -422,14 +477,14 @@ void loop() {
     while(yield(),!digitalRead(button_pin));
     mytime = millis() - mytime;
     if(mytime > (10*1000)){
-      Serial.println("WARNING: Factory reset!");
+      DEBUG("WARNING: Factory reset!\n");
       memcpy(&params, &factory_params, sizeof(params));
       save_eeprom();
       quick_blink(30);
       ESP.restart();
     }
     else if(mytime > (2*1000)){
-      Serial.println("Back to normal");
+      DEBUG("Back to normal\n");
       set_relay(OFF);
       state = ST_STARTING;
       next_time = millis();
@@ -440,57 +495,65 @@ void loop() {
       // If forced off, continue forever
       state = ST_FORCING;
       set_relay(1-relay_state);
-      if(relay_state == ON)next_time = millis() + (params.max_forced_duration * 60 * 1000);
+      if(relay_state == ON){
+	next_time = millis() + (params.max_forced_duration * 60 * 1000);
+	DEBUG("Setting ST_FORCING, millis=%lu next_time=%lu\n", millis(), next_time);
+      }
       else next_time = 0;
-      delay(100);
     }
   }
   mytime = millis();
-  if(!mytime % 1024)loop_login();
+  if(!mytime % (4 * 1024)){
+    loop_login(); // Update logout every ~5 seconds
+    if(WiFi.status() != WL_CONNECTED)try_connect_wifi();
+  }
   if((next_time != 0) && (mytime > next_time)){
+    DEBUG("millis=%lu next_time=%lu\n"); mytime, next_time;
     state++;
     if(state > ST_DRIVING)state = ST_PAUSING;
     switch(state){
     case ST_PAUSING:
-      set_relay(OFF);
+      if(params.time_pause) set_relay(OFF); // Dont stop relay if no time_pause
       // Manage millis() overflow after 49 days
       // We force a reset every 20 days ;-lso avoid time becoming negative ;-)
       if(mytime > (1000L * 60 * 60 * 24 * 20)){
-        Serial.println("Resetting in order to avoid time overflow!");
+        DEBUG("Resetting in order to avoid time overflow!\n");
         ESP.restart();
       }
-      if(!WiFi.isConnected())try_connect_wifi();
       mytime = millis();
       next_time = mytime + 1000 * params.time_pause;
-      Serial.println("PAUSING");
+      DEBUG("PAUSING\n");
       break;
     case ST_SENSING:
       nb_dry = 0;
       nb_sense = 0;
       next_time = mytime + 1000 * params.time_sense;
-      Serial.println("SENSING");
+      DEBUG("SENSING\n");
       break;
     case ST_DRIVING:
-      Serial.print("nb_dry=");
-      Serial.print(nb_dry);
-      Serial.print(" nb_sense=");
-      Serial.println(nb_sense);
+      DEBUG("nb_dry=%d nb_sense=%d\n", nb_dry, nb_sense);
       i = (nb_dry * 100) / nb_sense;
-      Serial.print("DRIVING ");
+      DEBUG("DRIVING\n");
       if(i > params.min_dry_percent){
-        if(!max_on_time)max_on_time = mytime + params.max_on_duration * (1000 * 60); 
+        if(!max_on_time){
+	  max_on_time = mytime + params.max_on_duration * (1000 * 60); 
+	  DEBUG("Start forced ON time, millis=%ul, max_ontime:%ul\n", millis(), max_on_time);
+	}
         else if(mytime > max_on_time){
-          Serial.println("ALARM");
+          DEBUG("ALARM\n");
           set_relay(OFF);
+	  relay_status = OFF;
           state = ST_ALARM;
           break;
         }
-        Serial.println("ON");
+        DEBUG("ON\n");
         set_relay(ON);
+	relay_status = ON;
       }
       else {
-        Serial.println("OFF");
+        DEBUG("OFF\n");
         set_relay(OFF);
+	relay_status = OFF;
         max_on_time = 0;
       }
       next_time = mytime + 1000 * params.time_drive;
